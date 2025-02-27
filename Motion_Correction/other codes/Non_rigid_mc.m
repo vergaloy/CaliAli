@@ -1,92 +1,176 @@
-function V = Non_rigid_mc(V, ref, opt)
+function Y = Non_rigid_mc(Y, ref, opt)
 %% Non_rigid_mc: Perform non-rigid motion correction using multi-level registration.
 %
-% This function applies non-rigid motion correction to an input video using a
-% multi-level registration approach. It constructs a pyramid of images (e.g.,
-% blood vessel and neuron projections) and applies log-domain demons registration
-% to align frames while preserving fine details.
-%% Note: This code is experimental and may introduce undesired deformations when adjusting for non-rigid deformation.
+% This function applies non-rigid motion correction to an input video.
+% The correction is performed using multi-level registration, incorporating
+% optical flow for motion estimation.
 %
 % Inputs:
-%   V   - Input video as a 3D array (height x width x frames).
-%   ref - Reference image for initial alignment.
-%   opt - Structure containing registration options.
+%   Y   - Input video (3D array)
+%   ref - Reference image for alignment
+%   opt - Options structure containing registration parameters
 %
 % Outputs:
-%   V   - Motion-corrected video.
-%
-% Usage:
-%   V_corrected = Non_rigid_mc(V, ref, opt);
-%
+%   Y   - Motion-corrected video
+
 % Author: Pablo Vergara
 % Contact: pablo.vergara.g@ug.uchile.cl
 % Date: 2025
 
-% Get a pyramid of images (e.g., blood vessel and neuron projections)
-fprintf('Appling non-rigid motion correction...\n');
-[X] = get_video_pyramid(V, ref, opt);
+% Generate a pyramid of images (e.g., blood vessel and neuron projections)
+fprintf('Applying non-rigid motion correction...\n');
+[X] = get_video_pyramid(Y, ref, opt);
 
 % Perform non-rigid motion correction in parallel
-V = NR_motion_correction_parallel(X, V, opt);
+Y = NR_motion_correction_parallel(X, Y, opt);
 end
 
 
-function V = NR_motion_correction_parallel(X, V, opt)
-% NR_motion_correction_parallel performs parallel non-rigid motion correction.
+function Y = NR_motion_correction_parallel(X, Y, opt)
+% NR_motion_correction_parallel: Applies non-rigid motion correction in parallel.
 %
-%   V = NR_motion_correction_parallel(X, V, opt)
+% Inputs:
+%   X   - 4D array of image pyramids for registration
+%   Y   - Original video
+%   opt - Options structure
 %
-%   This function performs non-rigid motion correction on a video in parallel
-%   by dividing it into smaller batches and registering each batch independently.
-%
-%   Inputs:
-%       X   - 4D array of images (pyramid) used for registration.
-%       V   - Input video as a 3D array.
-%       opt - Structure containing registration options.
-%
-%   Outputs:
-%       V   - Motion-corrected video.
+% Outputs:
+%   Y   - Motion-corrected video
+for i = size(X,3):-1:1
+    motionSource = squeeze(X(:,:,i,:));
 
-% Calculate translation scores on the last level of the pyramid (neurons by default)
-[ms1, ~] = get_trans_score(mat2gray(squeeze(X(:,:,1,:))), [], 1, 1, 0.3);
+    % Calculate motion scores for adaptive processing
+    ms = get_motion_score(motionSource);
 
-% Distribute the video into smaller batches for parallel processing
-[MS, G, V] = distribute(X, V, ms1, opt.non_rigid_batch_size);
+    % Distribute the video into smaller batches based on motion scores
+    [MS, motionSource] = distribute(motionSource, ms, opt.non_rigid_batch_size);
 
-% Perform motion correction on each batch in parallel
-V = MC_in(MS, G, V, opt.non_rigid_options);
-
+    % Perform motion correction on each batch in parallel
+    [Y, X] = MC_in(MS, motionSource,X,Y, opt.non_rigid_options);
+end
 
 end
 
 
-function [MS, G, Vc] = distribute(X, V, ms, win)
-% distribute divides a video into smaller batches for parallel processing.
+function X = get_video_pyramid(Y, ref, opt)
+% get_video_pyramid: Creates a multi-level image pyramid for registration.
 %
-%   [MS, G, Vc] = distribute(X, V, ms, win)
+% Inputs:
+%   Y   - Input video (3D array)
+%   ref - Reference image for alignment
+%   opt - Structure containing registration options
 %
-%   This function divides a video into smaller batches based on motion scores
-%   and a specified window size.
-%
-%   Inputs:
-%       X   - 4D array of images (pyramid) used for registration.
-%       V   - Input video as a 3D array.
-%       ms  - Motion scores used to determine batch boundaries.
-%       win - 2-element vector specifying the minimum and maximum batch size.
-%
-%   Outputs:
-%       MS  - Cell array of motion scores for each batch.
-%       G   - Cell array of image pyramids for each batch.
-%       Vc  - Cell array of video batches.
+% Outputs:
+%   X   - 4D array of images (pyramid) for motion correction
 
-disp('Distributing video in small batches...');
+order = opt.non_rigid_pyramid;  % Get the order of pyramid projections
 
-% Identify regions of low motion to define batch boundaries
+% Apply Gaussian filtering based on selected reference projection type
+switch opt.reference_projection_rigid
+    case 'BV'
+        BV = imgaussfilt3(ref, [2,2,2]);
+    case 'centroid'
+        Cen = ref;
+    case 'high_pass'
+        HP = ref;
+end
+clear ref;
+
+% Compute image projections if they do not exist
+if ismember('BV', order) && ~exist('BV','var')
+    BV = CaliAli_get_blood_vessels(Y, opt);
+    BV = imgaussfilt3(BV, [2,2,2]);
+end
+if ismember('neuron', order) && ~exist('Neu','var')
+    opt.preprocessing.detrend=false;
+    opt.preprocessing.noise_scale=false;
+    Neu = v2uint8(CaliAli_remove_background(Y, opt));
+end
+if ismember('high_pass', order) && ~exist('HP','var')
+    HP = get_filtered_projection(Y, opt);
+end
+
+% Generate centroid projection
+if ismember('centroid', order)
+    Neu = v2uint8(Neu);
+    thr = prctile(Neu(Neu>0), 5);
+    for i = progress(1:size(Neu,3), 'Title', 'Getting centroids')
+        img = Neu(:,:,i) > thr;
+        stats = regionprops(img, 'Centroid');
+        dot_img = false(size(img));
+
+        for k = 1:length(stats)
+            centroid = round(stats(k).Centroid);
+            dot_img(centroid(2), centroid(1)) = 1;
+        end
+        Cen(:,:,i) = adapthisteq(imgaussfilt(single(dot_img), 2), 'NumTiles', [4 4], 'ClipLimit', 0.8);
+    end
+end
+
+% Construct the pyramid
+X = [];
+order = flip(order);
+for i = 1:numel(order)
+    switch order{i}
+        case 'BV'
+            X = cat(4, X, v2uint8(BV));
+        case 'neuron'
+            X = cat(4, X, Neu);
+        case 'centroid'
+            X = cat(4, X, v2uint8(Cen));
+        case 'high_pass'
+            X = cat(4, X, v2uint8(HP));
+    end
+end
+
+% Reorder dimensions for processing
+X = permute(X, [1, 2, 4, 3]);
+end
+
+function score = get_motion_score(motionSource)
+% get_motion_score: Computes motion scores using optical flow.
+%
+% Inputs:
+%   motionSource - 3D array representing motion images
+%
+% Outputs:
+%   score - Computed motion score per frame
+
+opticFlow = opticalFlowFarneback('NumPyramidLevels',1, 'NumIterations',2);
+reset(opticFlow)
+flow = estimateFlow(opticFlow, motionSource(:,:,1));
+
+for i = 2:size(motionSource,3)
+    flow = estimateFlow(opticFlow, motionSource(:,:,i-1));
+    D(:,:,:,i) = cat(3, flow.Vx, flow.Vy);
+end
+
+% Apply Gaussian smoothing
+D(:,:,1,:) = imgaussfilt3(squeeze(D(:,:,1,:)), [2,2,2]);
+D(:,:,2,:) = imgaussfilt3(squeeze(D(:,:,2,:)), [2,2,2]);
+
+% Compute mean absolute motion score
+score = squeeze(mean(squeeze(abs(D(:,:,1,:)) + abs(D(:,:,2,:))), [1,2]));
+end
+
+function [MS, motionSource_out] = distribute(motionSource, ms, win)
+% distribute: Divides video into smaller batches for parallel processing.
+%
+% Inputs:
+%   motionSource - 4D array of images for registration
+%   ms           - Motion scores for batch segmentation
+%   win          - Batch size constraints [min, max]
+%
+% Outputs:
+%   MS                - Cell array of motion scores per batch
+%   motionSource_out  - Cell array of batch-segmented motion data
+
+disp('Distributing video into small batches...');
+
 v = movmedian(ms < prctile(ms, 50), 50) > 0.5;
-v(1:win(2):end) = 0;  % Ensure minimum spacing between batches
-CC = bwlabel(v);  % Label connected components
+v(1:win(2):end) = 0;  % Ensure minimum spacing
+CC = bwlabel(v);
 
-% Remove small regions to ensure minimum batch size
 rp = regionprops(logical(CC), 'area');
 for i = 1:max(CC)
     if rp(i).Area < win(1)
@@ -95,178 +179,79 @@ for i = 1:max(CC)
     end
 end
 
-% Fill gaps between batches using nearest neighbor interpolation
 CC(CC == 0) = nan;
 CC = fillmissing(CC, 'nearest');
 
-% Distribute the video and image pyramids into batches
 for i = 1:max(CC)
     MS{i} = ms(CC == i);
-    G{i} = X(:,:,:,CC == i);
-    Vc{i} = V(:,:,CC == i);
+    motionSource_out{i} = motionSource(:,:,CC == i);
 end
 end
 
-
-function V = MC_in(MS, G, V, opt)
-% MC_in performs motion correction within each batch.
-%
-%   [V, G] = MC_in(MS, G, V, opt)
-%
-%   This function performs motion correction within each batch of a video
-%   using the provided registration options.
-%
-%   Inputs:
-%       MS  - Cell array of motion scores for each batch.
-%       G   - Cell array of image pyramids for each batch.
-%       V   - Cell array of video batches.
-%       opt - Structure containing registration options.
-%
-%   Outputs:
-%       V   - Cell array of motion-corrected video batches.
-%       G   - Cell array of registered image pyramids.
-
+function [Y,X] = MC_in(MS, MotionSource,X, Y, opt)
 % Perform motion correction within each batch in parallel
-disp('Performing non-rigid motion correction...');
+% % 
+[~,I]=cellfun(@(x) min(x),MS,'UniformOutput', false);
+
+M=cellfun(@(x,y) x(:,:,y),MotionSource,I,'UniformOutput', false);
+M=cat(3,M{:});
+
+D=cell(1,length(MS));
 parfor k = 1:length(MS)
-    D{k} = batch_register(G{k},opt, MS{k});  % Register the batch
+     [D{k},Gout{k}] = batch_register(MotionSource{k},opt,MS{k},M(:,:,k));  % Register the batch
 end
 
 % Warp the video frames based on the calculated displacement fields
 
 D=cat(4,D{:});
 
-D(:,:,1,:) = imgaussfilt3(squeeze(D(:,:,1,:)),[0.5,0.5,2]);
-D(:,:,2,:) = imgaussfilt3(squeeze(D(:,:,2,:)),[0.5,0.5,2]);
-
-V=cat(3,V{:});
+D(:,:,1,:)=imgaussfilt3(squeeze(D(:,:,1,:)),[0.5,0.5,0.5]);
+D(:,:,2,:)=imgaussfilt3(squeeze(D(:,:,2,:)),[0.5,0.5,0.5]);
 
 for i = progress(1:size(D,4),'Title','Applying shifts')
-    V(:,:,i) = imwarp(V(:,:,i), D(:,:,:,i), 'FillValues', 0);
-end
-
-end
-
-
-function [D] = batch_register(G,opt, MS)
-% batch_register registers a batch of images to a reference image.
-%
-%   [O, D, V] = batch_register(G, V, opt, T)
-%
-%   This function registers a batch of images to a reference image using
-%   log-domain demons registration.
-%
-%   Inputs:
-%       G   - 4D array of images to register.
-%       V   - 3D array of video frames corresponding to the images.
-%       opt - Structure containing registration options.
-%       MS   - Motions scores.
-%
-%   Outputs:
-%       O   - 4D array of registered images.
-%       D   - 4D array of displacement fields.
-%       V   - 3D array of registered video frames.
-
-[~, ix] = min(MS);  % Find the frame with the lowest motion score
-
-ref=G(:,:,:,ix);
-[d1,d2,~,d4]=size(G);
-D=zeros(d1,d2,2,d4);
-thr=prctile(G(G>0),5);
-[~,order]=sort(abs((1:d4)-ix),'ascend');
-
-for i = 1:numel(order)
-    [~, temp(:,:,:,i), D(:,:,:,order(i))] = MR_Log_demon(ref,G(:,:,:,order(i)), opt);
-    temp(temp<thr)=nan;
-    ref=mean(temp,4,'omitnan');
-end
-
-end
-
-
-function X = get_video_pyramid(Y, ref, opt)
-% get_video_pyramid creates a pyramid of images for registration.
-%
-%   X = get_video_pyramid(Y, ref, opt)
-%
-%   This function creates a pyramid of images (e.g., blood vessel and neuron
-%   projections) based on the specified order in the options.
-%
-%   Inputs:
-%       Y   - Input video as a 3D array.
-%       ref - Reference image utilized during translations. This is to
-%       avoid recalculating this projections.
-%       opt - Structure containing registration options.
-%
-%   Outputs:
-%       X   - 4D array of images (pyramid).
-
-order = opt.non_rigid_pyramid;  % Get the desired order of projections
-
-% If the reference projection used during translation is 'BV'
-if strcmp(opt.reference_projection_rigid, 'BV')
-    BV = ref;  % Assign the reference image to BV
-    if ismember('neuron', order)|| ismember('centroid', order)  % If 'neuron' is in the order
-        Neu = CaliAli_remove_background(Y, opt);  % Calculate neuron projection
-        se=strel("disk",2);
-        Neu=v2uint8(Neu);
-        Neu(Neu>100)=100;
-        Neu=v2uint8(Neu);
-        Neu(Neu<30)=0;
-        parfor i=1:size(Neu,3)
-            temp=Neu(:,:,i);
-            temp=imopen(temp,se);
-            Neu(:,:,i)=adapthisteq(temp,"distribution","exponential");
-        end
-
-    else
-        Neu = [];  % Otherwise, set Neu to empty
-    end
-    clear ref;  % Delete the original reference image
-
-    % If the reference projection used during translation is 'neuron'
-elseif strcmp(opt.reference_projection_rigid, 'neuron')
-    Neu = ref;  % Assign the reference image to Neu
-    if ismember('BV', order)  % If 'BV' is in the order
-        BV = CaliAli_get_blood_vessels(Y, opt);  % Calculate blood vessel projection
-    else
-        BV = [];  % Otherwise, set BV to empty
-    end
-    clear ref;    % Delete the original reference image
-end
-
-if  ismember('centroid', order)
-    Neu=v2uint8(Neu);
-    thr=prctile(Neu(Neu>0),5);
-    for i=progress(1:size(Neu,3),'Title','Getting centroids')
-        img=Neu(:,:,i)>thr;
-        stats = regionprops(img, 'Centroid'); % Get centroids of blobs
-
-        % Create an empty image and mark centroids
-        dot_img = false(size(img));
-
-        for k = 1:length(stats)
-            centroid = round(stats(k).Centroid); % Get integer centroid
-            dot_img(centroid(2), centroid(1)) = 1; % Mark as a dot
-        end
-        centroid_img(:,:,i) = adapthisteq(imgaussfilt(single(dot_img),2),'NumTiles',[4 4],'ClipLimit',0.8);
+    Y(:,:,i) = imwarp(Y(:,:,i), D(:,:,:,i), 'FillValues', 0);
+    for k = 1:size(X,3)
+        X(:,:,k,i) = imwarp(squeeze(X(:,:,k,i)), D(:,:,:,i), 'FillValues', 0);
     end
 end
 
-X = [];  % Initialize the image pyramid
-order=flip(order);
-% Construct the pyramid based on the specified order
-for i = 1:numel(order)
-    switch order{i}
-        case 'BV'
-            X = cat(4, X, v2uint8(BV));  % Concatenate BV along the 4th dimension
-        case 'neuron'
-            X = cat(4, X,Neu);  % Concatenate Neu along the 4th dimension
-        case 'centroid'
-            X = cat(4,X,v2uint8(centroid_img));
-    end
 end
 
-% Permute the dimensions for proper registration
-X = permute(X, [1, 2, 4, 3]);
+function [D,G] = batch_register(motionSource,opt,ms,ref)
+[~,ix]=min(ms);
+if ~exist("ref","var")
+ref=motionSource(:,:,ix);
+end
+
+pad_size=30;
+motionSource = padarray(motionSource, [pad_size, pad_size, 0], "replicate", 'both');
+
+[d1,d2,d3]=size(motionSource);
+D=zeros(d1,d2,2,d3);
+
+[~,I]=sort(abs((1:d3)-ix),'ascend');
+
+ref = padarray(ref, [pad_size, pad_size, 0], "replicate", 'both');
+opticFlow = opticalFlowFarneback(opt);
+ref_temp=ref;
+for i = ix:-1:1
+    flow = estimateFlow(opticFlow, ref_temp);
+    flow = estimateFlow(opticFlow, motionSource(:,:,i));
+    D(:,:,:,i) = cat(3, flow.Vx, flow.Vy);
+    D(pad_size+1:end-pad_size, pad_size+1:end-pad_size, :,:)=0;
+    ref_temp = imwarp(motionSource(:,:,i), D(:,:,:,i)); 
+    G(:,:,i)=ref_temp;
+end
+ref_temp=ref;
+
+for i = ix+1:1:d3
+    flow = estimateFlow(opticFlow, ref_temp);
+    flow = estimateFlow(opticFlow, motionSource(:,:,i));
+    D(:,:,:,i) = cat(3, flow.Vx, flow.Vy);
+    ref_temp = imwarp(motionSource(:,:,i), D(:,:,:,i)); 
+    G(:,:,i)=ref_temp;
+end
+
+D = D(pad_size+1:end-pad_size, pad_size+1:end-pad_size, :,:);
+
 end

@@ -78,11 +78,6 @@ function [out, duse] = get_trans_score(Y, flag, ispara, isdisp, mq, maskc)
             catch
                 acorr(i - 1) = NaN;
             end
-            if isdisp
-                if mod(i, round(nframes / 10)) == 0
-                    disp(['computed score of frame #', num2str(i), '/', num2str(nframes)])
-                end
-            end
         end
     end
     
@@ -92,6 +87,7 @@ function [out, duse] = get_trans_score(Y, flag, ispara, isdisp, mq, maskc)
         acorr(idss) = interp1(ids, acorr(ids), idss, 'pchip', 'extrap');
     end
 
-    out=zeros(1,d);
+    out=zeros(1,nframes);
     out(1:length(acorr))=acorr;
+    out(end)=out(end-1);
 end
